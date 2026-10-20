@@ -194,9 +194,9 @@ STRICT RULES:
 Return ONLY valid JSON in exactly this shape:
 [{"question":"...","answer":"...","category":"..."}]
 
-WEBSITE PAGE (${pageUrl}):
+WEBSITE PAGE ({pageUrl}):
 ---
-${pageMarkdown}
+{pageMarkdown}
 ---`;
 
 async function extractFaqsFromPage(page) {
@@ -205,17 +205,28 @@ async function extractFaqsFromPage(page) {
     page.markdown.slice(0, 16000)
   );
 
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${GEN_MODEL}:generateContent?key=${GEMINI_KEY}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: { responseMimeType: "application/json", temperature: 0.2 },
-      }),
+  // Retry on rate limits (429) and overload (503) with increasing waits.
+  let res;
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${GEN_MODEL}:generateContent?key=${GEMINI_KEY}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { responseMimeType: "application/json", temperature: 0.2 },
+        }),
+      }
+    );
+    if (res.status === 429 || res.status === 503) {
+      const waitSec = attempt * 10;
+      console.warn(`      (HTTP ${res.status} on ${page.url}, retry ${attempt}/5 in ${waitSec}s)`);
+      await new Promise((r) => setTimeout(r, waitSec * 1000));
+      continue;
     }
-  );
+    break;
+  }
   if (!res.ok) throw new Error(`Gemini generateContent HTTP ${res.status} for ${page.url}`);
 
   const data = await res.json();
@@ -258,14 +269,24 @@ async function embedAll(texts) {
       outputDimensionality: EMBED_DIMS,
     }));
 
-    const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${EMBED_MODEL}:batchEmbedContents?key=${GEMINI_KEY}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ requests }),
+    let res;
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${EMBED_MODEL}:batchEmbedContents?key=${GEMINI_KEY}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ requests }),
+        }
+      );
+      if (res.status === 429 || res.status === 503) {
+        const waitSec = attempt * 10;
+        console.warn(`      (HTTP ${res.status} embedding batch ${bi + 1}, retry ${attempt}/5 in ${waitSec}s)`);
+        await new Promise((r) => setTimeout(r, waitSec * 1000));
+        continue;
       }
-    );
+      break;
+    }
     if (!res.ok) throw new Error(`Gemini batchEmbedContents HTTP ${res.status}`);
     const data = await res.json();
     for (const emb of data.embeddings) vectors.push(emb.values);
@@ -293,6 +314,7 @@ async function main() {
   console.log(`[2/3] Generating FAQ pairs with Gemini (${GEN_MODEL})...`);
   const allFaqs = [...SEED_FAQS.map((f) => ({ ...f, source_url: `${CRAWL_URL}/faq` }))];
   for (const page of pages) {
+    await new Promise((r) => setTimeout(r, 2000)); // stay under Gemini rate limits
     try {
       const faqs = await extractFaqsFromPage(page);
       console.log(`      ${faqs.length} FAQs from ${page.url}`);

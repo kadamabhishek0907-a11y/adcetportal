@@ -20,7 +20,8 @@ const GEN_TIMEOUT_MS = 20000;
 
 // Below this cosine similarity the question doesn't match any FAQ well
 // enough, and we suggest alternatives instead of guessing.
-const MATCH_THRESHOLD = 0.42;
+// (Related questions score ~0.65-0.90; unrelated ones usually stay below 0.6.)
+const MATCH_THRESHOLD = 0.6;
 
 const ANSWER_PROMPT = `You are the FAQ assistant for ADCET (Annasaheb Dange College of Engineering and Technology, Ashta).
 
