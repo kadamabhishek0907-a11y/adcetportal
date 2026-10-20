@@ -10,7 +10,13 @@ lerna-debug.log*
 node_modules
 dist
 dist-ssr
+dist.zip
 *.local
+
+# API keys — never commit
+.env
+.env.*
+!.env.example
 
 # Editor directories and files
 .vscode/*

@@ -2,35 +2,41 @@ import { readFileSync } from "fs";
 import { fileURLToPath } from "url";
 import path from "path";
 
+// FAQ-type bot: the knowledge base is a list of curated question/answer pairs
+// (api/faq-index.json, built by `npm run build:faq`). We embed the user's
+// question, find the closest FAQ question, and answer from that FAQ entry.
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const vectors = JSON.parse(
-  readFileSync(path.join(__dirname, "vectors.json"), "utf-8")
+const faqIndex = JSON.parse(
+  readFileSync(path.join(__dirname, "faq-index.json"), "utf-8")
 );
+const FAQS = faqIndex.faqs || [];
 
-const EMBED_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent?key=";
+const EMBED_URL =
+  "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent?key=";
 
 // Primary first; automatic fallback when the primary is unavailable (Google outages).
 const GEN_MODELS = ["gemini-3.6-flash", "gemini-3.5-flash-lite"];
 const GEN_TIMEOUT_MS = 20000;
 
-const ANSWER_PROMPT = `You are the AI answer engine for an Adaptive Knowledge
-Lifecycle Management (AKLM) system. Answer the user's question using ONLY the
-retrieved website information provided below.
+// Below this cosine similarity the question doesn't match any FAQ well
+// enough, and we suggest alternatives instead of guessing.
+const MATCH_THRESHOLD = 0.42;
 
-USER QUESTION:
-{question}
+const ANSWER_PROMPT = `You are the FAQ assistant for ADCET (Annasaheb Dange College of Engineering and Technology, Ashta).
 
-RETRIEVED WEBSITE INFORMATION:
-{context}
+The user asked a question. The knowledge base matched it to this frequently asked question and its official answer:
 
-ANSWERING RULES:
-1. USE ONLY RETRIEVED INFORMATION. Do not use outside knowledge. Do not invent facts.
-2. If the answer is explicitly stated, answer directly.
-3. You may count items from retrieved lists.
-4. You may make reasonable inferences but clearly distinguish them from explicit facts. Do NOT over-infer.
-5. You may perform simple calculations. Be careful with "+" values.
-6. If the retrieved information is insufficient, say: "I couldn't find that information on the website."
-7. Be concise. Do not explain the RAG process. Do not mention embeddings, vector databases, similarity scores, or internal implementation details.`;
+MATCHED FAQ QUESTION: {faqQuestion}
+
+OFFICIAL ANSWER: {faqAnswer}
+
+USER QUESTION: {userQuestion}
+
+Write a helpful reply to the user:
+1. Base it ONLY on the official answer above. Do not invent facts, dates or numbers.
+2. Answer directly and naturally, as a friendly college helpdesk assistant would.
+3. 1-3 sentences. If the official answer is short, keep your reply short.
+4. Do not mention FAQs, matching, embeddings or how you work.`;
 
 function dot(a, b) {
   let s = 0;
@@ -95,12 +101,15 @@ async function generateWithFallback(apiKey, prompt) {
 
 export default async function handler(req, res) {
   if (req.method !== "POST") {
-    return res.status(405).json({ answer: "Method not allowed", sources: [] });
+    return res.status(405).json({ answer: "Method not allowed", matched: false });
   }
 
   const question = ((req.body && req.body.question) || "").toString().trim();
   if (!question) {
-    return res.status(400).json({ answer: "Please ask a question about ADCET.", sources: [] });
+    return res.status(400).json({
+      answer: "Please ask a question about ADCET.",
+      matched: false,
+    });
   }
 
   try {
@@ -110,45 +119,53 @@ export default async function handler(req, res) {
       model: "models/gemini-embedding-001",
       content: { parts: [{ text: question }] },
       taskType: "RETRIEVAL_QUERY",
+      outputDimensionality: faqIndex.embedding_dimensions || 3072,
     });
     const q = embedData.embedding.values;
     const qn = norm(q);
 
-    const scored = vectors.map((v) => ({
-      v,
-      s: dot(q, v.embedding) / (qn * norm(v.embedding)),
+    const scored = FAQS.map((f) => ({
+      f,
+      s: qn && norm(f.embedding) ? dot(q, f.embedding) / (qn * norm(f.embedding)) : 0,
     }));
     scored.sort((a, b) => b.s - a.s);
-    const top = scored.slice(0, 5);
+    const best = scored[0];
 
-    const context = top
-      .map(
-        (r, i) =>
-          `--- Retrieved Source ${i + 1} ---\n` +
-          `Chunk ID: ${r.v.id}\n` +
-          `Similarity score: ${r.s.toFixed(4)}\n` +
-          `Source URL: ${r.v.source_url}\n` +
-          `Website content:\n${r.v.text}\n` +
-          `--- End Source ${i + 1} ---`
-      )
-      .join("\n");
+    // No FAQ is close enough -> don't guess, offer alternatives.
+    if (!best || best.s < MATCH_THRESHOLD) {
+      const suggestions = scored.slice(0, 3).map((r) => r.f.question);
+      return res.status(200).json({
+        answer:
+          "I'm not sure about that one — my answers come from ADCET's frequently asked questions. " +
+          "Try asking about admissions, courses, hostel, placements, faculty or contacts. " +
+          `You could also ask things like: "${suggestions[0]}"`,
+        matched: false,
+        suggestions,
+      });
+    }
 
-    const prompt = ANSWER_PROMPT.replace("{question}", question).replace("{context}", context);
+    const prompt = ANSWER_PROMPT.replace(/\{faqQuestion\}/g, best.f.question)
+      .replace(/\{faqAnswer\}/g, best.f.answer)
+      .replace(/\{userQuestion\}/g, question);
 
-    const answer = await generateWithFallback(key, prompt);
+    // Answer with Gemini; if Gemini is down, fall back to the official answer verbatim.
+    let answer;
+    try {
+      answer = await generateWithFallback(key, prompt);
+    } catch {
+      answer = best.f.answer;
+    }
 
     return res.status(200).json({
       answer,
-      sources: top.map((r) => ({
-        chunk_id: r.v.id,
-        source_url: r.v.source_url,
-        score: r.s,
-      })),
+      matched: true,
+      matched_faq: { id: best.f.id, question: best.f.question, category: best.f.category },
+      score: best.s,
     });
-  } catch (e) {
+  } catch {
     return res.status(200).json({
       answer: "Sorry, the AI service is temporarily unavailable. Please try again later.",
-      sources: [],
+      matched: false,
     });
   }
 }
